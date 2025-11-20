@@ -16,6 +16,26 @@ type Tokenizer interface {
 	Tokenize(text string) []Token
 }
 
+// TokenizerFor returns a tokenizer implementation based on a friendly name.
+// Supported options include:
+//   - "standard" (default): simple tokenizer without stopword removal
+//   - "standard_en": simple tokenizer with a small English stopword list
+//
+// Any unrecognized name falls back to the standard tokenizer.
+func TokenizerFor(name string) Tokenizer {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "standard_en":
+		return NewSimpleTokenizer(englishStopwords)
+	default:
+		return NewSimpleTokenizer(nil)
+	}
+}
+
+var englishStopwords = []string{
+	"a", "an", "the", "and", "or", "but", "of", "to", "in", "on", "for", "with", "as",
+	"at", "by", "from", "into", "about", "over", "after", "before", "between", "without",
+}
+
 // SimpleTokenizer lowercases input, splits on non-alphanumeric boundaries, and removes stopwords.
 type SimpleTokenizer struct {
 	stopwords map[string]struct{}

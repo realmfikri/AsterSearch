@@ -57,6 +57,10 @@ func main() {
 	engineCfg := indexEngineConfig{
 		mergeInterval:  cfg.IndexDefaults.MergeInterval,
 		mergeThreshold: cfg.IndexDefaults.MergeThreshold,
+		flushThresholds: index.FlushThresholds{
+			MaxDocuments: cfg.IndexDefaults.FlushMaxDocs,
+			MaxPostings:  cfg.IndexDefaults.FlushMaxPosts,
+		},
 	}
 
 	telemetry := newTelemetry(cfg.Metrics.Enabled != nil && *cfg.Metrics.Enabled)
@@ -163,8 +167,9 @@ type apiServer struct {
 }
 
 type indexEngineConfig struct {
-	mergeInterval  time.Duration
-	mergeThreshold int
+	mergeInterval   time.Duration
+	mergeThreshold  int
+	flushThresholds index.FlushThresholds
 }
 
 func newAPIServer(registry *index.Registry, engCfg indexEngineConfig, telemetry *telemetry) *apiServer {
@@ -290,17 +295,23 @@ func (s *apiServer) indexDocuments(w http.ResponseWriter, r *http.Request, name 
 		return
 	}
 
-	indexed, segmentID, errs := engine.indexDocuments(payload.Documents, s.registry)
+	indexed, segmentIDs, errs := engine.indexDocuments(payload.Documents, s.registry)
 	status := http.StatusOK
 	if indexed == 0 {
 		status = http.StatusBadRequest
 	}
 
+	segmentID := ""
+	if len(segmentIDs) > 0 {
+		segmentID = segmentIDs[len(segmentIDs)-1]
+	}
+
 	respond(w, status, map[string]any{
-		"indexed":   indexed,
-		"errors":    errs,
-		"segmentId": segmentID,
-		"timingMs":  time.Since(start).Milliseconds(),
+		"indexed":    indexed,
+		"errors":     errs,
+		"segmentId":  segmentID,
+		"segmentIds": segmentIDs,
+		"timingMs":   time.Since(start).Milliseconds(),
 	})
 }
 
@@ -425,7 +436,7 @@ type indexEngine struct {
 }
 
 func newIndexEngine(def index.Definition, registry *index.Registry, cfg indexEngineConfig) *indexEngine {
-	tokenizer := index.NewSimpleTokenizer(nil)
+	tokenizer := index.TokenizerFor(def.Tokenizer)
 	mergeInterval := cfg.mergeInterval
 	if mergeInterval == 0 {
 		mergeInterval = 30 * time.Second
@@ -439,7 +450,7 @@ func newIndexEngine(def index.Definition, registry *index.Registry, cfg indexEng
 		def:            def,
 		registry:       registry,
 		tokenizer:      tokenizer,
-		writer:         index.NewInMemoryIndex(def, tokenizer, index.FlushThresholds{}),
+		writer:         index.NewInMemoryIndex(def, tokenizer, cfg.flushThresholds),
 		mergeInterval:  mergeInterval,
 		mergeThreshold: mergeThreshold,
 		mergeCh:        make(chan struct{}, 1),
@@ -449,12 +460,25 @@ func newIndexEngine(def index.Definition, registry *index.Registry, cfg indexEng
 	return eng
 }
 
-func (e *indexEngine) indexDocuments(docs []map[string]any, registry *index.Registry) (int, string, []string) {
+func (e *indexEngine) indexDocuments(docs []map[string]any, registry *index.Registry) (int, []string, []string) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
 	var errs []string
 	indexed := 0
+	var segmentIDs []string
+	pendingWrite := false
+
+	flush := func() {
+		snapshot := e.writer.Flush()
+		e.segments = append(e.segments, snapshot)
+
+		segmentID := fmt.Sprintf("seg-%d-%d", time.Now().UnixNano(), len(segmentIDs))
+		e.def.Metadata.DocCount += snapshot.Stats.TotalDocs
+		e.def.Metadata.Segments = append(e.def.Metadata.Segments, index.SegmentMetadata{ID: segmentID, DocumentCount: snapshot.Stats.TotalDocs})
+		segmentIDs = append(segmentIDs, segmentID)
+		pendingWrite = false
+	}
 
 	for i, doc := range docs {
 		if err := e.writer.IndexDocument(doc); err != nil {
@@ -462,26 +486,28 @@ func (e *indexEngine) indexDocuments(docs []map[string]any, registry *index.Regi
 			continue
 		}
 		indexed++
+
+		pendingWrite = true
+		if e.writer.ShouldFlush() {
+			flush()
+		}
 	}
 
 	if indexed == 0 {
-		return 0, "", errs
+		return 0, nil, errs
 	}
 
-	snapshot := e.writer.Flush()
-	e.segments = append(e.segments, snapshot)
+	if pendingWrite {
+		flush()
+	}
 
-	segmentID := fmt.Sprintf("seg-%d", time.Now().UnixNano())
-	e.def.Metadata.DocCount += snapshot.Stats.TotalDocs
-	e.def.Metadata.Segments = append(e.def.Metadata.Segments, index.SegmentMetadata{ID: segmentID, DocumentCount: snapshot.Stats.TotalDocs})
-
-	if registry != nil {
+	if registry != nil && len(segmentIDs) > 0 {
 		_ = registry.UpdateDefinition(e.def)
 	}
 
 	e.maybeScheduleMergeLocked()
 
-	return indexed, segmentID, errs
+	return indexed, segmentIDs, errs
 }
 
 func (e *indexEngine) maybeScheduleMergeLocked() {

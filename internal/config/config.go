@@ -37,6 +37,8 @@ type IndexDefaultsConfig struct {
 	BM25           BM25Config    `toml:"bm25" yaml:"bm25"`
 	MergeInterval  time.Duration `toml:"merge_interval" yaml:"merge_interval"`
 	MergeThreshold int           `toml:"merge_threshold" yaml:"merge_threshold"`
+	FlushMaxDocs   int           `toml:"flush_max_documents" yaml:"flush_max_documents"`
+	FlushMaxPosts  int           `toml:"flush_max_postings" yaml:"flush_max_postings"`
 }
 
 // BM25Config mirrors the scoring parameters exposed by the index package.
@@ -65,6 +67,8 @@ func DefaultConfig() AppConfig {
 			BM25:           BM25Config{K1: 1.2, B: 0.75},
 			MergeInterval:  30 * time.Second,
 			MergeThreshold: 4,
+			FlushMaxDocs:   512,
+			FlushMaxPosts:  50000,
 		},
 		Logging: LoggingConfig{RequestLogs: boolPtr(true)},
 		Metrics: MetricsConfig{Enabled: boolPtr(true)},
@@ -124,6 +128,12 @@ func mergeConfig(base, override AppConfig) AppConfig {
 	}
 	if override.IndexDefaults.MergeThreshold != 0 {
 		base.IndexDefaults.MergeThreshold = override.IndexDefaults.MergeThreshold
+	}
+	if override.IndexDefaults.FlushMaxDocs != 0 {
+		base.IndexDefaults.FlushMaxDocs = override.IndexDefaults.FlushMaxDocs
+	}
+	if override.IndexDefaults.FlushMaxPosts != 0 {
+		base.IndexDefaults.FlushMaxPosts = override.IndexDefaults.FlushMaxPosts
 	}
 
 	if override.Logging.RequestLogs != nil {

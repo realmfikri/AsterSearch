@@ -299,7 +299,7 @@ It’s designed as:
 * Defaults: listens on `:8080`, stores indexes in `data/indexes`, enables request logs + metrics.
 * Flags: `--config` (TOML/YAML), `--listen`, `--index-path`.
 * Environment: `ASTERSEARCH_INDEX_PATH` overrides the storage directory (kept for backward compatibility).
-* Config examples live in `config/examples/config.toml` and `config/examples/config.yaml` and support per-index defaults (tokenizer, BM25 `k1/b`, merge interval/threshold) as well as logging/metrics toggles.
+* Config examples live in `config/examples/config.toml` and `config/examples/config.yaml` and support per-index defaults (tokenizer, BM25 `k1/b`, merge interval/threshold, flush_max_documents/flush_max_postings) as well as logging/metrics toggles.
 
 ### Running the server directly
 
@@ -314,6 +314,10 @@ go run ./... --listen :8080 --index-path ./data/indexes
 * JSON request logging is on by default; disable via `logging.request_logs = false`.
 * `/v1/metrics` returns basic counters (requests, errors, last status/latency) when enabled.
 * Standard `/v1/health` endpoint is included for liveness probes.
+
+### Load testing
+
+The `loadtest/` directory provides a k6 scenario that drives `POST /v1/indexes/{index}/documents` and `GET /v1/search` with realistic payloads. Thresholds are pre-wired for the latency/QPS targets above; see `loadtest/README.md` for commands and expected outputs.
 
 ### Systemd unit (for :8080)
 
