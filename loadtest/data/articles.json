@@ -1,0 +1,122 @@
+[
+  {
+    "id": "seed-1",
+    "title": "Scaling search infrastructure with Go",
+    "body": "We explore building a lightweight search stack with BM25 ranking and custom tokenization in Go.",
+    "tags": ["search", "go", "bm25"],
+    "lang": "en",
+    "views": 1200
+  },
+  {
+    "id": "seed-2",
+    "title": "Tokenizer design choices for multilingual content",
+    "body": "Stopwords, stemming, and Unicode normalization impact precision and recall across languages.",
+    "tags": ["tokenizer", "nlp", "unicode"],
+    "lang": "en",
+    "views": 860
+  },
+  {
+    "id": "seed-3",
+    "title": "Practical BM25 tuning for product search",
+    "body": "We benchmark k1 and b parameters for catalog search to balance length normalization.",
+    "tags": ["bm25", "ranking", "ecommerce"],
+    "lang": "en",
+    "views": 650
+  },
+  {
+    "id": "seed-4",
+    "title": "Segment merge strategies in log-structured indexes",
+    "body": "Aggressive flush thresholds can fragment segments and hurt query latency.",
+    "tags": ["segments", "storage", "performance"],
+    "lang": "en",
+    "views": 430
+  },
+  {
+    "id": "seed-5",
+    "title": "Benchmarking REST APIs with k6",
+    "body": "We demonstrate using k6 scenarios to measure P50 and P95 latency for search workloads.",
+    "tags": ["benchmark", "k6", "latency"],
+    "lang": "en",
+    "views": 980
+  },
+  {
+    "id": "seed-6",
+    "title": "Comparing BM25 with neural rerankers",
+    "body": "Hybrid search pairs sparse retrieval with transformer-based reranking for better relevance.",
+    "tags": ["bm25", "transformers", "hybrid"],
+    "lang": "en",
+    "views": 1570
+  },
+  {
+    "id": "seed-7",
+    "title": "Deploying AsterSearch on a single node",
+    "body": "A simple binary with YAML config makes it easy to run search on a small VPS.",
+    "tags": ["ops", "deployment", "yaml"],
+    "lang": "en",
+    "views": 720
+  },
+  {
+    "id": "seed-8",
+    "title": "How tokenizer stopwords affect recall",
+    "body": "English stopwords remove filler terms and can improve precision on short queries.",
+    "tags": ["tokenizer", "stopwords", "recall"],
+    "lang": "en",
+    "views": 540
+  },
+  {
+    "id": "seed-9",
+    "title": "Understanding BM25 math",
+    "body": "Inverse document frequency and term frequency work together to score relevant documents.",
+    "tags": ["bm25", "idf", "tf"],
+    "lang": "en",
+    "views": 1110
+  },
+  {
+    "id": "seed-10",
+    "title": "Fast ingestion pipelines for search",
+    "body": "Batching and bounded segment flush sizes keep indexing latency predictable.",
+    "tags": ["ingestion", "batching", "segments"],
+    "lang": "en",
+    "views": 1340
+  },
+  {
+    "id": "seed-11",
+    "title": "Rust vs Go for indexers",
+    "body": "We compare memory layouts and concurrency primitives for ingest-heavy workloads.",
+    "tags": ["rust", "go", "indexing"],
+    "lang": "en",
+    "views": 780
+  },
+  {
+    "id": "seed-12",
+    "title": "Optimizing merge thresholds",
+    "body": "Tune merge intervals and thresholds to avoid too many tiny segments during ingestion spikes.",
+    "tags": ["merge", "thresholds", "tuning"],
+    "lang": "en",
+    "views": 630
+  },
+  {
+    "id": "seed-13",
+    "title": "Observability for search services",
+    "body": "Expose health, metrics, and structured logs to track request latency and errors.",
+    "tags": ["observability", "metrics", "logs"],
+    "lang": "en",
+    "views": 880
+  },
+  {
+    "id": "seed-14",
+    "title": "Full-text search filters and facets",
+    "body": "Combine keyword filters with BM25 scoring to deliver precise results.",
+    "tags": ["filters", "facets", "bm25"],
+    "lang": "en",
+    "views": 920
+  },
+  {
+    "id": "seed-15",
+    "title": "Request-level benchmarks for APIs",
+    "body": "Measure latency distributions and request rates to meet SLOs under load.",
+    "tags": ["benchmark", "slo", "latency"],
+    "lang": "en",
+    "views": 1010
+  }
+]

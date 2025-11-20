@@ -6,6 +6,8 @@ index_defaults:
   tokenizer: "standard"
   merge_interval: 45s
   merge_threshold: 6
+  flush_max_documents: 512
+  flush_max_postings: 50000
   bm25:
     k1: 1.4
     b: 0.7
