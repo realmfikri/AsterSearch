@@ -63,6 +63,34 @@ func (m *SegmentManifest) AddSegment(meta index.SegmentMetadata, appliedOffset i
 	return m.persist()
 }
 
+// ReplaceSegments atomically swaps a set of existing segments with a new collection and persists the change.
+// This is useful for compaction/merge operations where deleted or superseded segments should disappear together
+// with the publication of a new merged segment.
+func (m *SegmentManifest) ReplaceSegments(removeIDs []string, add []index.SegmentMetadata, appliedOffset int64) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	removals := make(map[string]struct{}, len(removeIDs))
+	for _, id := range removeIDs {
+		removals[id] = struct{}{}
+	}
+
+	filtered := make([]index.SegmentMetadata, 0, len(m.Segments)+len(add))
+	for _, seg := range m.Segments {
+		if _, drop := removals[seg.ID]; drop {
+			continue
+		}
+		filtered = append(filtered, seg)
+	}
+
+	filtered = append(filtered, add...)
+	sort.Slice(filtered, func(i, j int) bool { return filtered[i].ID < filtered[j].ID })
+
+	m.Segments = filtered
+	m.AppliedWALOffset = appliedOffset
+	return m.persist()
+}
+
 // UpdateOffset updates the WAL watermark without modifying segments.
 func (m *SegmentManifest) UpdateOffset(offset int64) error {
 	m.mu.Lock()
