@@ -61,7 +61,7 @@ func newAPIServer(registry *index.Registry) *apiServer {
 	}
 
 	for _, def := range registry.List() {
-		server.engines[def.Name] = newIndexEngine(def)
+		server.engines[def.Name] = newIndexEngine(def, registry)
 	}
 
 	return server
@@ -142,7 +142,7 @@ func (s *apiServer) createIndex(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.mu.Lock()
-	s.engines[def.Name] = newIndexEngine(def)
+	s.engines[def.Name] = newIndexEngine(def, s.registry)
 	s.mu.Unlock()
 
 	respond(w, http.StatusCreated, map[string]any{"index": def, "timingMs": time.Since(start).Milliseconds()})
@@ -296,19 +296,33 @@ func parseIntDefault(raw string, defaultVal int) (int, error) {
 
 type indexEngine struct {
 	def       index.Definition
+	registry  *index.Registry
 	tokenizer index.Tokenizer
 	writer    *index.InMemoryIndex
 	segments  []index.SegmentSnapshot
-	mu        sync.RWMutex
+
+	mergeInterval  time.Duration
+	mergeThreshold int
+	mergeCh        chan struct{}
+	stopCh         chan struct{}
+
+	mu sync.RWMutex
 }
 
-func newIndexEngine(def index.Definition) *indexEngine {
+func newIndexEngine(def index.Definition, registry *index.Registry) *indexEngine {
 	tokenizer := index.NewSimpleTokenizer(nil)
-	return &indexEngine{
-		def:       def,
-		tokenizer: tokenizer,
-		writer:    index.NewInMemoryIndex(def, tokenizer, index.FlushThresholds{}),
+	eng := &indexEngine{
+		def:            def,
+		registry:       registry,
+		tokenizer:      tokenizer,
+		writer:         index.NewInMemoryIndex(def, tokenizer, index.FlushThresholds{}),
+		mergeInterval:  30 * time.Second,
+		mergeThreshold: 4,
+		mergeCh:        make(chan struct{}, 1),
+		stopCh:         make(chan struct{}),
 	}
+	go eng.mergeLoop()
+	return eng
 }
 
 func (e *indexEngine) indexDocuments(docs []map[string]any, registry *index.Registry) (int, string, []string) {
@@ -341,7 +355,83 @@ func (e *indexEngine) indexDocuments(docs []map[string]any, registry *index.Regi
 		_ = registry.UpdateDefinition(e.def)
 	}
 
+	e.maybeScheduleMergeLocked()
+
 	return indexed, segmentID, errs
+}
+
+func (e *indexEngine) maybeScheduleMergeLocked() {
+	if len(e.segments) <= 1 {
+		return
+	}
+	if len(e.segments) >= e.mergeThreshold {
+		e.enqueueMerge()
+		return
+	}
+
+	smallSegments := 0
+	for _, seg := range e.segments {
+		if seg.Stats.TotalDocs < 10 {
+			smallSegments++
+		}
+	}
+	if smallSegments >= 2 {
+		e.enqueueMerge()
+	}
+}
+
+func (e *indexEngine) enqueueMerge() {
+	select {
+	case e.mergeCh <- struct{}{}:
+	default:
+	}
+}
+
+func (e *indexEngine) mergeLoop() {
+	ticker := time.NewTicker(e.mergeInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			e.compactSegments()
+		case <-e.mergeCh:
+			e.compactSegments()
+		case <-e.stopCh:
+			return
+		}
+	}
+}
+
+func (e *indexEngine) compactSegments() {
+	e.mu.RLock()
+	segments := append([]index.SegmentSnapshot{}, e.segments...)
+	def := e.def
+	registry := e.registry
+	tokenizer := e.tokenizer
+	e.mu.RUnlock()
+
+	if len(segments) <= 1 {
+		return
+	}
+
+	merged := mergeSegments(def, tokenizer, segments)
+	mergedID := fmt.Sprintf("merge-%d", time.Now().UnixNano())
+
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	// Re-check length after acquiring the write lock to avoid racing with a concurrent writer that already merged.
+	if len(e.segments) <= 1 {
+		return
+	}
+
+	e.segments = []index.SegmentSnapshot{merged}
+	e.def.Metadata.DocCount = merged.Stats.TotalDocs
+	e.def.Metadata.Segments = []index.SegmentMetadata{{ID: mergedID, DocumentCount: merged.Stats.TotalDocs}}
+
+	if registry != nil {
+		_ = registry.UpdateDefinition(e.def)
+	}
 }
 
 func (e *indexEngine) search(req index.SearchRequest) index.SearchResponse {
@@ -350,12 +440,12 @@ func (e *indexEngine) search(req index.SearchRequest) index.SearchResponse {
 	def := e.def
 	e.mu.RUnlock()
 
-	snapshot := mergeSegments(segments)
+	snapshot := mergeSegments(def, e.tokenizer, segments)
 	searcher := index.NewSearcher(def, snapshot, e.tokenizer)
 	return searcher.Search(req)
 }
 
-func mergeSegments(segments []index.SegmentSnapshot) index.SegmentSnapshot {
+func mergeSegments(def index.Definition, tokenizer index.Tokenizer, segments []index.SegmentSnapshot) index.SegmentSnapshot {
 	merged := index.SegmentSnapshot{
 		Postings: make(map[string][]index.Posting),
 		Docs:     []map[string]any{},
@@ -368,43 +458,106 @@ func mergeSegments(segments []index.SegmentSnapshot) index.SegmentSnapshot {
 		return merged
 	}
 
-	fieldTotals := make(map[string]float64)
-	docsByID := make(map[string]map[string]any)
+	liveDocs := make(map[string]map[string]any)
+	deletedDocs := make(map[string]struct{})
 
 	for _, seg := range segments {
-		merged.Stats.TotalDocs += seg.Stats.TotalDocs
-		for field, avg := range seg.Stats.AvgFieldLengths {
-			fieldTotals[field] += avg * float64(seg.Stats.TotalDocs)
-		}
-
-		for term, postings := range seg.Postings {
-			merged.Postings[term] = append(merged.Postings[term], postings...)
-		}
-
 		for _, doc := range seg.Docs {
-			if id, ok := doc["id"].(string); ok {
-				docsByID[id] = doc
+			id, ok := doc["id"].(string)
+			if !ok || id == "" {
+				continue
+			}
+
+			if isDeletedDoc(doc) {
+				delete(liveDocs, id)
+				deletedDocs[id] = struct{}{}
+				continue
+			}
+
+			delete(deletedDocs, id)
+			liveDocs[id] = doc
+		}
+	}
+
+	for _, seg := range segments {
+		for term, postings := range seg.Postings {
+			for _, p := range postings {
+				if _, removed := deletedDocs[p.DocID]; removed {
+					continue
+				}
+				if _, exists := liveDocs[p.DocID]; !exists {
+					continue
+				}
+				merged.Postings[term] = append(merged.Postings[term], p)
 			}
 		}
 	}
 
-	if merged.Stats.TotalDocs > 0 {
-		for field, total := range fieldTotals {
-			merged.Stats.AvgFieldLengths[field] = total / float64(merged.Stats.TotalDocs)
-		}
-	}
-
-	for _, postings := range merged.Postings {
+	for term, postings := range merged.Postings {
 		sort.Slice(postings, func(i, j int) bool {
 			return postings[i].DocID < postings[j].DocID
 		})
+		merged.Postings[term] = postings
 	}
 
-	for _, doc := range docsByID {
+	for _, doc := range liveDocs {
 		merged.Docs = append(merged.Docs, doc)
 	}
 
+	merged.Stats = rebuildStats(def, tokenizer, merged.Docs)
+
 	return merged
+}
+
+func rebuildStats(def index.Definition, tokenizer index.Tokenizer, docs []map[string]any) index.BM25Stats {
+	if tokenizer == nil {
+		tokenizer = index.NewSimpleTokenizer(nil)
+	}
+
+	totals := make(map[string]int)
+
+	for _, doc := range docs {
+		for fieldName, fieldDef := range def.Fields {
+			value, ok := doc[fieldName]
+			if !ok {
+				continue
+			}
+
+			switch fieldDef.Type {
+			case index.FieldTypeText:
+				totals[fieldName] += len(tokenizer.Tokenize(fmt.Sprint(value)))
+			case index.FieldTypeKeyword:
+				switch v := value.(type) {
+				case string:
+					if strings.TrimSpace(v) != "" {
+						totals[fieldName]++
+					}
+				case []string:
+					totals[fieldName] += len(v)
+				}
+			}
+		}
+	}
+
+	stats := index.BM25Stats{TotalDocs: len(docs), AvgFieldLengths: make(map[string]float64)}
+	if stats.TotalDocs == 0 {
+		return stats
+	}
+
+	for field, total := range totals {
+		stats.AvgFieldLengths[field] = float64(total) / float64(stats.TotalDocs)
+	}
+
+	return stats
+}
+
+func isDeletedDoc(doc map[string]any) bool {
+	deleted, ok := doc["_deleted"]
+	if !ok {
+		return false
+	}
+	flag, ok := deleted.(bool)
+	return ok && flag
 }
 
 func httpStatusForError(err error) int {
