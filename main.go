@@ -1,10 +1,11 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"sort"
@@ -16,9 +17,20 @@ import (
 
 	"astersearch/internal/config"
 	"astersearch/internal/index"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/collectors"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	prometheusotel "go.opentelemetry.io/otel/exporters/prometheus"
+	"go.opentelemetry.io/otel/metric"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 )
 
 func main() {
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	ctx := context.Background()
+
 	cfg := config.DefaultConfig()
 
 	configPath := flag.String("config", "", "Path to a TOML or YAML config file")
@@ -29,7 +41,8 @@ func main() {
 	if *configPath != "" {
 		loaded, err := config.Load(*configPath)
 		if err != nil {
-			log.Fatalf("failed to load config: %v", err)
+			logger.Error("failed to load config", "error", err)
+			os.Exit(1)
 		}
 		cfg = loaded
 	}
@@ -51,7 +64,8 @@ func main() {
 		BM25:      index.BM25Parameters{K1: bm25K1, B: bm25B},
 	})
 	if err != nil {
-		log.Fatalf("failed to initialize index registry: %v", err)
+		logger.Error("failed to initialize index registry", "error", err)
+		os.Exit(1)
 	}
 
 	engineCfg := indexEngineConfig{
@@ -63,13 +77,14 @@ func main() {
 		},
 	}
 
-	telemetry := newTelemetry(cfg.Metrics.Enabled != nil && *cfg.Metrics.Enabled)
-	server := newAPIServer(registry, engineCfg, telemetry)
+	telemetry := newTelemetry(ctx, logger, cfg.Metrics.Enabled != nil && *cfg.Metrics.Enabled)
+	server := newAPIServer(registry, engineCfg, telemetry, logger)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/indexes", server.handleIndexes)
 	mux.HandleFunc("/v1/indexes/", server.handleIndexByName)
 	mux.HandleFunc("/v1/search", server.handleSearch)
 	mux.HandleFunc("/v1/health", server.handleHealth)
+	mux.HandleFunc("/v1/ready", server.handleReadiness)
 	if telemetry.enabled {
 		mux.HandleFunc("/v1/metrics", telemetry.handleMetrics)
 	}
@@ -77,9 +92,9 @@ func main() {
 	handler := withJSONHeaders(mux)
 	handler = withTelemetry(handler, telemetry, cfg.Logging.RequestLogs == nil || (cfg.Logging.RequestLogs != nil && *cfg.Logging.RequestLogs))
 
-	log.Printf("AsterSearch API listening on %s (index path: %s)", cfg.Server.Listen, cfg.Paths.IndexDir)
+	logger.Info("AsterSearch API listening", "listen", cfg.Server.Listen, "indexPath", cfg.Paths.IndexDir)
 	if err := http.ListenAndServe(cfg.Server.Listen, handler); err != nil {
-		log.Fatal(err)
+		logger.Error("server stopped", "error", err)
 	}
 }
 
@@ -101,21 +116,96 @@ func (r *responseRecorder) WriteHeader(status int) {
 }
 
 type telemetry struct {
-	enabled     bool
+	enabled bool
+	logger  *slog.Logger
+
+	registry       *prometheus.Registry
+	metricsHandler http.Handler
+	meter          metric.Meter
+
 	reqCount    atomic.Int64
 	errCount    atomic.Int64
 	lastStatus  atomic.Int64
 	lastLatency atomic.Int64
+
+	httpRequests  metric.Int64Counter
+	httpErrors    metric.Int64Counter
+	httpLatency   metric.Float64Histogram
+	indexDocs     metric.Int64Counter
+	indexLatency  metric.Float64Histogram
+	searchOps     metric.Int64Counter
+	searchLatency metric.Float64Histogram
+
+	segmentGauge *prometheus.GaugeVec
+	walGauge     *prometheus.GaugeVec
 }
 
-func newTelemetry(enabled bool) *telemetry {
-	return &telemetry{enabled: enabled}
+func newTelemetry(ctx context.Context, logger *slog.Logger, enabled bool) *telemetry {
+	telemetry := &telemetry{enabled: enabled, logger: logger}
+	if !enabled {
+		return telemetry
+	}
+
+	registry := prometheus.NewRegistry()
+	registry.MustRegister(collectors.NewGoCollector())
+	registry.MustRegister(collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
+
+	exporter, err := prometheusotel.New(prometheusotel.WithRegisterer(registry))
+	if err != nil {
+		logger.Error("failed to initialize prometheus exporter", "error", err)
+		return telemetry
+	}
+
+	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(exporter))
+	otel.SetMeterProvider(provider)
+	meter := provider.Meter("astersearch")
+
+	httpReq, _ := meter.Int64Counter("http_requests_total", metric.WithDescription("Total HTTP requests"))
+	httpErr, _ := meter.Int64Counter("http_errors_total", metric.WithDescription("HTTP requests that returned an error status"))
+	httpLatency, _ := meter.Float64Histogram("http_request_duration_ms", metric.WithDescription("Latency of HTTP requests in milliseconds"), metric.WithUnit("ms"))
+	indexDocs, _ := meter.Int64Counter("index_documents_total", metric.WithDescription("Documents processed by the indexing pipeline"))
+	indexLatency, _ := meter.Float64Histogram("index_latency_ms", metric.WithDescription("Latency of index mutations"), metric.WithUnit("ms"))
+	searchOps, _ := meter.Int64Counter("search_requests_total", metric.WithDescription("Search operations executed"))
+	searchLatency, _ := meter.Float64Histogram("search_latency_ms", metric.WithDescription("Latency of search operations"), metric.WithUnit("ms"))
+
+	segmentGauge := prometheus.NewGaugeVec(prometheus.GaugeOpts{Namespace: "astersearch", Name: "segments", Help: "Segments currently tracked per index"}, []string{"index"})
+	walGauge := prometheus.NewGaugeVec(prometheus.GaugeOpts{Namespace: "astersearch", Name: "wal_offset_bytes", Help: "Last recorded WAL offset"}, []string{"index"})
+	registry.MustRegister(segmentGauge, walGauge)
+
+	telemetry.registry = registry
+	telemetry.metricsHandler = promhttp.HandlerFor(registry, promhttp.HandlerOpts{})
+	telemetry.meter = meter
+	telemetry.httpRequests = httpReq
+	telemetry.httpErrors = httpErr
+	telemetry.httpLatency = httpLatency
+	telemetry.indexDocs = indexDocs
+	telemetry.indexLatency = indexLatency
+	telemetry.searchOps = searchOps
+	telemetry.searchLatency = searchLatency
+	telemetry.segmentGauge = segmentGauge
+	telemetry.walGauge = walGauge
+
+	telemetry.logger.Info("telemetry initialized", "prometheus", true)
+	telemetry.httpRequests.Add(ctx, 0) // ensure metric is created eagerly
+	return telemetry
 }
 
-func (t *telemetry) record(status int, duration time.Duration) {
+func (t *telemetry) recordRequest(ctx context.Context, method, path string, status int, duration time.Duration) {
 	if !t.enabled {
 		return
 	}
+
+	attrs := metric.WithAttributes(
+		attribute.String("method", method),
+		attribute.String("path", path),
+		attribute.Int("status", status),
+	)
+	t.httpRequests.Add(ctx, 1, attrs)
+	t.httpLatency.Record(ctx, float64(duration.Milliseconds()), attrs)
+	if status >= http.StatusBadRequest {
+		t.httpErrors.Add(ctx, 1, attrs)
+	}
+
 	t.reqCount.Add(1)
 	t.lastStatus.Store(int64(status))
 	t.lastLatency.Store(duration.Milliseconds())
@@ -124,21 +214,45 @@ func (t *telemetry) record(status int, duration time.Duration) {
 	}
 }
 
-func (t *telemetry) handleMetrics(w http.ResponseWriter, _ *http.Request) {
+func (t *telemetry) recordIndexing(ctx context.Context, indexName string, documents int, segments int, errs int, duration time.Duration) {
 	if !t.enabled {
+		return
+	}
+
+	attrs := metric.WithAttributes(attribute.String("index", indexName))
+	t.indexDocs.Add(ctx, int64(documents), attrs)
+	t.indexLatency.Record(ctx, float64(duration.Milliseconds()), attrs)
+	t.segmentGauge.WithLabelValues(indexName).Set(float64(segments))
+	if errs > 0 {
+		t.httpErrors.Add(ctx, int64(errs), attrs)
+	}
+}
+
+func (t *telemetry) recordSearch(ctx context.Context, indexName string, hits int, duration time.Duration) {
+	if !t.enabled {
+		return
+	}
+
+	attrs := metric.WithAttributes(attribute.String("index", indexName))
+	t.searchOps.Add(ctx, 1, attrs)
+	t.searchLatency.Record(ctx, float64(duration.Milliseconds()), attrs)
+}
+
+func (t *telemetry) observeWAL(indexName string, offset int64) {
+	if !t.enabled {
+		return
+	}
+
+	t.walGauge.WithLabelValues(indexName).Set(float64(offset))
+}
+
+func (t *telemetry) handleMetrics(w http.ResponseWriter, r *http.Request) {
+	if !t.enabled || t.registry == nil {
 		respond(w, http.StatusOK, map[string]any{"enabled": false})
 		return
 	}
 
-	snapshot := map[string]any{
-		"enabled":         true,
-		"requests":        t.reqCount.Load(),
-		"errors":          t.errCount.Load(),
-		"lastStatus":      t.lastStatus.Load(),
-		"lastLatencyMs":   t.lastLatency.Load(),
-		"uptimeTimestamp": time.Now().UTC().Format(time.RFC3339),
-	}
-	respond(w, http.StatusOK, snapshot)
+	t.metricsHandler.ServeHTTP(w, r)
 }
 
 func withTelemetry(next http.Handler, telemetry *telemetry, logRequests bool) http.Handler {
@@ -149,10 +263,10 @@ func withTelemetry(next http.Handler, telemetry *telemetry, logRequests bool) ht
 		duration := time.Since(start)
 
 		if telemetry != nil {
-			telemetry.record(recorder.status, duration)
+			telemetry.recordRequest(r.Context(), r.Method, r.URL.Path, recorder.status, duration)
 		}
-		if logRequests {
-			log.Printf("%s %s -> %d (%s)", r.Method, r.URL.Path, recorder.status, duration)
+		if logRequests && telemetry != nil && telemetry.logger != nil {
+			telemetry.logger.Info("request completed", "method", r.Method, "path", r.URL.Path, "status", recorder.status, "duration_ms", duration.Milliseconds())
 		}
 	})
 }
@@ -163,7 +277,9 @@ type apiServer struct {
 	engines   map[string]*indexEngine
 	engineCfg indexEngineConfig
 	telemetry *telemetry
+	logger    *slog.Logger
 	mu        sync.RWMutex
+	ready     atomic.Bool
 }
 
 type indexEngineConfig struct {
@@ -172,17 +288,19 @@ type indexEngineConfig struct {
 	flushThresholds index.FlushThresholds
 }
 
-func newAPIServer(registry *index.Registry, engCfg indexEngineConfig, telemetry *telemetry) *apiServer {
+func newAPIServer(registry *index.Registry, engCfg indexEngineConfig, telemetry *telemetry, logger *slog.Logger) *apiServer {
 	server := &apiServer{
 		registry:  registry,
 		engines:   make(map[string]*indexEngine),
 		engineCfg: engCfg,
 		telemetry: telemetry,
+		logger:    logger,
 	}
 
 	for _, def := range registry.List() {
-		server.engines[def.Name] = newIndexEngine(def, registry, engCfg)
+		server.engines[def.Name] = newIndexEngine(def, registry, engCfg, telemetry, logger)
 	}
+	server.ready.Store(true)
 
 	return server
 }
@@ -262,7 +380,7 @@ func (s *apiServer) createIndex(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.mu.Lock()
-	s.engines[def.Name] = newIndexEngine(def, s.registry, s.engineCfg)
+	s.engines[def.Name] = newIndexEngine(def, s.registry, s.engineCfg, s.telemetry, s.logger)
 	s.mu.Unlock()
 
 	respond(w, http.StatusCreated, map[string]any{"index": def, "timingMs": time.Since(start).Milliseconds()})
@@ -276,6 +394,7 @@ func (s *apiServer) listIndexes(w http.ResponseWriter, _ *http.Request) {
 
 func (s *apiServer) indexDocuments(w http.ResponseWriter, r *http.Request, name string) {
 	start := time.Now()
+	ctx := r.Context()
 
 	engine, ok := s.getEngine(name)
 	if !ok {
@@ -295,7 +414,7 @@ func (s *apiServer) indexDocuments(w http.ResponseWriter, r *http.Request, name 
 		return
 	}
 
-	indexed, segmentIDs, errs := engine.indexDocuments(payload.Documents, s.registry)
+	indexed, segmentIDs, errs := engine.indexDocuments(ctx, payload.Documents, s.registry)
 	status := http.StatusOK
 	if indexed == 0 {
 		status = http.StatusBadRequest
@@ -313,6 +432,10 @@ func (s *apiServer) indexDocuments(w http.ResponseWriter, r *http.Request, name 
 		"segmentIds": segmentIDs,
 		"timingMs":   time.Since(start).Milliseconds(),
 	})
+
+	if s.logger != nil {
+		s.logger.Info("index request processed", "index", name, "documents", len(payload.Documents), "indexed", indexed, "status", status, "duration_ms", time.Since(start).Milliseconds())
+	}
 }
 
 func (s *apiServer) indexStats(w http.ResponseWriter, _ *http.Request, name string) {
@@ -375,7 +498,7 @@ func (s *apiServer) handleSearch(w http.ResponseWriter, r *http.Request) {
 		Filters:  r.URL.Query().Get("filters"),
 	}
 
-	resp := engine.search(req)
+	resp := engine.search(r.Context(), req)
 
 	respond(w, http.StatusOK, map[string]any{
 		"index":     indexName,
@@ -386,11 +509,37 @@ func (s *apiServer) handleSearch(w http.ResponseWriter, r *http.Request) {
 		"results":   resp.Hits,
 		"timingMs":  time.Since(start).Milliseconds(),
 	})
+
+	if s.logger != nil {
+		s.logger.Info("search completed", "index", indexName, "query", query, "hits", resp.TotalHits, "duration_ms", time.Since(start).Milliseconds())
+	}
 }
 
 func (s *apiServer) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	start := time.Now()
 	respond(w, http.StatusOK, map[string]any{"status": "ok", "timingMs": time.Since(start).Milliseconds()})
+}
+
+func (s *apiServer) handleReadiness(w http.ResponseWriter, _ *http.Request) {
+	start := time.Now()
+	ready := s.ready.Load()
+	engineCount := len(s.engines)
+	if ready && engineCount != len(s.registry.List()) {
+		ready = false
+	}
+
+	status := http.StatusOK
+	if !ready {
+		status = http.StatusServiceUnavailable
+	}
+
+	respond(w, status, map[string]any{
+		"status":     map[bool]string{true: "ready", false: "initializing"}[ready],
+		"engines":    engineCount,
+		"timingMs":   time.Since(start).Milliseconds(),
+		"registry":   len(s.registry.List()),
+		"lastStatus": status,
+	})
 }
 
 func (s *apiServer) getEngine(name string) (*indexEngine, bool) {
@@ -426,6 +575,8 @@ type indexEngine struct {
 	tokenizer index.Tokenizer
 	writer    *index.InMemoryIndex
 	segments  []index.SegmentSnapshot
+	telemetry *telemetry
+	logger    *slog.Logger
 
 	mergeInterval  time.Duration
 	mergeThreshold int
@@ -435,7 +586,7 @@ type indexEngine struct {
 	mu sync.RWMutex
 }
 
-func newIndexEngine(def index.Definition, registry *index.Registry, cfg indexEngineConfig) *indexEngine {
+func newIndexEngine(def index.Definition, registry *index.Registry, cfg indexEngineConfig, telemetry *telemetry, logger *slog.Logger) *indexEngine {
 	tokenizer := index.TokenizerFor(def.Tokenizer)
 	mergeInterval := cfg.mergeInterval
 	if mergeInterval == 0 {
@@ -451,6 +602,8 @@ func newIndexEngine(def index.Definition, registry *index.Registry, cfg indexEng
 		registry:       registry,
 		tokenizer:      tokenizer,
 		writer:         index.NewInMemoryIndex(def, tokenizer, cfg.flushThresholds),
+		telemetry:      telemetry,
+		logger:         logger,
 		mergeInterval:  mergeInterval,
 		mergeThreshold: mergeThreshold,
 		mergeCh:        make(chan struct{}, 1),
@@ -460,7 +613,8 @@ func newIndexEngine(def index.Definition, registry *index.Registry, cfg indexEng
 	return eng
 }
 
-func (e *indexEngine) indexDocuments(docs []map[string]any, registry *index.Registry) (int, []string, []string) {
+func (e *indexEngine) indexDocuments(ctx context.Context, docs []map[string]any, registry *index.Registry) (int, []string, []string) {
+	start := time.Now()
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
@@ -506,6 +660,13 @@ func (e *indexEngine) indexDocuments(docs []map[string]any, registry *index.Regi
 	}
 
 	e.maybeScheduleMergeLocked()
+
+	if e.telemetry != nil {
+		e.telemetry.recordIndexing(ctx, e.def.Name, indexed, len(e.segments), len(errs), time.Since(start))
+	}
+	if e.logger != nil {
+		e.logger.Info("indexed documents", "index", e.def.Name, "documents", len(docs), "indexed", indexed, "errors", len(errs), "segments", len(e.segments), "duration_ms", time.Since(start).Milliseconds())
+	}
 
 	return indexed, segmentIDs, errs
 }
@@ -564,6 +725,7 @@ func (e *indexEngine) compactSegments() {
 	if len(segments) <= 1 {
 		return
 	}
+	start := time.Now()
 
 	merged := mergeSegments(def, tokenizer, segments)
 	mergedID := fmt.Sprintf("merge-%d", time.Now().UnixNano())
@@ -582,9 +744,17 @@ func (e *indexEngine) compactSegments() {
 	if registry != nil {
 		_ = registry.UpdateDefinition(e.def)
 	}
+
+	if e.telemetry != nil {
+		e.telemetry.recordIndexing(context.Background(), e.def.Name, merged.Stats.TotalDocs, len(e.segments), 0, time.Since(start))
+	}
+	if e.logger != nil {
+		e.logger.Info("segments compacted", "index", e.def.Name, "mergedSegments", len(segments), "docCount", merged.Stats.TotalDocs, "duration_ms", time.Since(start).Milliseconds())
+	}
 }
 
-func (e *indexEngine) search(req index.SearchRequest) index.SearchResponse {
+func (e *indexEngine) search(ctx context.Context, req index.SearchRequest) index.SearchResponse {
+	start := time.Now()
 	e.mu.RLock()
 	segments := append([]index.SegmentSnapshot{}, e.segments...)
 	def := e.def
@@ -592,7 +762,15 @@ func (e *indexEngine) search(req index.SearchRequest) index.SearchResponse {
 
 	snapshot := mergeSegments(def, e.tokenizer, segments)
 	searcher := index.NewSearcher(def, snapshot, e.tokenizer)
-	return searcher.Search(req)
+	resp := searcher.Search(req)
+
+	if e.telemetry != nil {
+		e.telemetry.recordSearch(ctx, e.def.Name, resp.TotalHits, time.Since(start))
+	}
+	if e.logger != nil {
+		e.logger.Info("search pipeline executed", "index", e.def.Name, "hits", resp.TotalHits, "duration_ms", time.Since(start).Milliseconds())
+	}
+	return resp
 }
 
 func mergeSegments(def index.Definition, tokenizer index.Tokenizer, segments []index.SegmentSnapshot) index.SegmentSnapshot {

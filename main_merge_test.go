@@ -1,6 +1,7 @@
 package main
 
 import (
+	"log/slog"
 	"testing"
 
 	"astersearch/internal/index"
@@ -50,7 +51,7 @@ func TestMergeSegmentsPrunesDeletesAndRebuildsStats(t *testing.T) {
 
 func TestIndexEngineCompactionReplacesSegmentsAndMetadata(t *testing.T) {
 	def := index.Definition{Fields: map[string]index.FieldDefinition{"title": {Type: index.FieldTypeText}}}
-	eng := newIndexEngine(def, nil, indexEngineConfig{})
+	eng := newIndexEngine(def, nil, indexEngineConfig{}, nil, slog.Default())
 	defer close(eng.stopCh)
 
 	segA := index.SegmentSnapshot{Docs: []map[string]any{{"id": "1", "title": "first"}}, Stats: index.BM25Stats{TotalDocs: 1}}
