@@ -153,6 +153,23 @@ func (r *Registry) Get(name string) (Definition, bool) {
 	return def, ok
 }
 
+// UpdateDefinition persists changes to an existing definition (e.g. runtime metadata updates).
+func (r *Registry) UpdateDefinition(def Definition) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if _, ok := r.indexes[def.Name]; !ok {
+		return fmt.Errorf("index '%s' not found", def.Name)
+	}
+
+	if err := r.persist(def); err != nil {
+		return err
+	}
+
+	r.indexes[def.Name] = def
+	return nil
+}
+
 func (r *Registry) persist(def Definition) error {
 	path := filepath.Join(r.basePath, fmt.Sprintf("%s.json", def.Name))
 	content, err := json.MarshalIndent(def, "", "  ")
