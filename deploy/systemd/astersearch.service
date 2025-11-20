@@ -1,0 +1,20 @@
+[Unit]
+Description=AsterSearch API server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=astersearch
+Group=astersearch
+WorkingDirectory=/var/lib/astersearch
+EnvironmentFile=-/etc/astersearch/astersearch.env
+ExecStart=/usr/local/bin/astersearch --config /etc/astersearch/config.toml
+Restart=on-failure
+RestartSec=5s
+LimitNOFILE=65536
+StandardOutput=append:/var/log/astersearch/server.log
+StandardError=append:/var/log/astersearch/server.log
+
+[Install]
+WantedBy=multi-user.target
