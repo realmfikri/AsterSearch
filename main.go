@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"flag"
 	"fmt"
 	"log"
 	"net/http"
@@ -10,32 +11,70 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"astersearch/internal/config"
 	"astersearch/internal/index"
 )
 
 func main() {
-	registryPath := os.Getenv("ASTERSEARCH_INDEX_PATH")
-	if registryPath == "" {
-		registryPath = "data/indexes"
+	cfg := config.DefaultConfig()
+
+	configPath := flag.String("config", "", "Path to a TOML or YAML config file")
+	listen := flag.String("listen", "", "Override the listen address (e.g. :8080)")
+	indexPath := flag.String("index-path", "", "Override the index storage directory")
+	flag.Parse()
+
+	if *configPath != "" {
+		loaded, err := config.Load(*configPath)
+		if err != nil {
+			log.Fatalf("failed to load config: %v", err)
+		}
+		cfg = loaded
 	}
 
-	registry, err := index.NewRegistry(registryPath)
+	if envPath := os.Getenv("ASTERSEARCH_INDEX_PATH"); envPath != "" {
+		cfg.Paths.IndexDir = envPath
+	}
+
+	if *listen != "" {
+		cfg.Server.Listen = *listen
+	}
+	if *indexPath != "" {
+		cfg.Paths.IndexDir = *indexPath
+	}
+
+	bm25K1, bm25B := cfg.ToBM25()
+	registry, err := index.NewRegistryWithDefaults(cfg.Paths.IndexDir, index.CreateDefaults{
+		Tokenizer: cfg.IndexDefaults.Tokenizer,
+		BM25:      index.BM25Parameters{K1: bm25K1, B: bm25B},
+	})
 	if err != nil {
 		log.Fatalf("failed to initialize index registry: %v", err)
 	}
 
-	server := newAPIServer(registry)
+	engineCfg := indexEngineConfig{
+		mergeInterval:  cfg.IndexDefaults.MergeInterval,
+		mergeThreshold: cfg.IndexDefaults.MergeThreshold,
+	}
+
+	telemetry := newTelemetry(cfg.Metrics.Enabled != nil && *cfg.Metrics.Enabled)
+	server := newAPIServer(registry, engineCfg, telemetry)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/indexes", server.handleIndexes)
 	mux.HandleFunc("/v1/indexes/", server.handleIndexByName)
 	mux.HandleFunc("/v1/search", server.handleSearch)
 	mux.HandleFunc("/v1/health", server.handleHealth)
+	if telemetry.enabled {
+		mux.HandleFunc("/v1/metrics", telemetry.handleMetrics)
+	}
 
-	addr := ":8080"
-	log.Printf("AsterSearch API listening on %s", addr)
-	if err := http.ListenAndServe(addr, withJSONHeaders(mux)); err != nil {
+	handler := withJSONHeaders(mux)
+	handler = withTelemetry(handler, telemetry, cfg.Logging.RequestLogs == nil || (cfg.Logging.RequestLogs != nil && *cfg.Logging.RequestLogs))
+
+	log.Printf("AsterSearch API listening on %s (index path: %s)", cfg.Server.Listen, cfg.Paths.IndexDir)
+	if err := http.ListenAndServe(cfg.Server.Listen, handler); err != nil {
 		log.Fatal(err)
 	}
 }
@@ -47,21 +86,97 @@ func withJSONHeaders(next http.Handler) http.Handler {
 	})
 }
 
+type responseRecorder struct {
+	http.ResponseWriter
+	status int
+}
+
+func (r *responseRecorder) WriteHeader(status int) {
+	r.status = status
+	r.ResponseWriter.WriteHeader(status)
+}
+
+type telemetry struct {
+	enabled     bool
+	reqCount    atomic.Int64
+	errCount    atomic.Int64
+	lastStatus  atomic.Int64
+	lastLatency atomic.Int64
+}
+
+func newTelemetry(enabled bool) *telemetry {
+	return &telemetry{enabled: enabled}
+}
+
+func (t *telemetry) record(status int, duration time.Duration) {
+	if !t.enabled {
+		return
+	}
+	t.reqCount.Add(1)
+	t.lastStatus.Store(int64(status))
+	t.lastLatency.Store(duration.Milliseconds())
+	if status >= http.StatusBadRequest {
+		t.errCount.Add(1)
+	}
+}
+
+func (t *telemetry) handleMetrics(w http.ResponseWriter, _ *http.Request) {
+	if !t.enabled {
+		respond(w, http.StatusOK, map[string]any{"enabled": false})
+		return
+	}
+
+	snapshot := map[string]any{
+		"enabled":         true,
+		"requests":        t.reqCount.Load(),
+		"errors":          t.errCount.Load(),
+		"lastStatus":      t.lastStatus.Load(),
+		"lastLatencyMs":   t.lastLatency.Load(),
+		"uptimeTimestamp": time.Now().UTC().Format(time.RFC3339),
+	}
+	respond(w, http.StatusOK, snapshot)
+}
+
+func withTelemetry(next http.Handler, telemetry *telemetry, logRequests bool) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		recorder := &responseRecorder{ResponseWriter: w, status: http.StatusOK}
+		start := time.Now()
+		next.ServeHTTP(recorder, r)
+		duration := time.Since(start)
+
+		if telemetry != nil {
+			telemetry.record(recorder.status, duration)
+		}
+		if logRequests {
+			log.Printf("%s %s -> %d (%s)", r.Method, r.URL.Path, recorder.status, duration)
+		}
+	})
+}
+
 type apiServer struct {
 	registry *index.Registry
 
-	engines map[string]*indexEngine
-	mu      sync.RWMutex
+	engines   map[string]*indexEngine
+	engineCfg indexEngineConfig
+	telemetry *telemetry
+	mu        sync.RWMutex
 }
 
-func newAPIServer(registry *index.Registry) *apiServer {
+type indexEngineConfig struct {
+	mergeInterval  time.Duration
+	mergeThreshold int
+}
+
+func newAPIServer(registry *index.Registry, engCfg indexEngineConfig, telemetry *telemetry) *apiServer {
 	server := &apiServer{
-		registry: registry,
-		engines:  make(map[string]*indexEngine),
+		registry:  registry,
+		engines:   make(map[string]*indexEngine),
+		engineCfg: engCfg,
+		telemetry: telemetry,
 	}
 
 	for _, def := range registry.List() {
-		server.engines[def.Name] = newIndexEngine(def, registry)
+		server.engines[def.Name] = newIndexEngine(def, registry, engCfg)
 	}
 
 	return server
@@ -142,7 +257,7 @@ func (s *apiServer) createIndex(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.mu.Lock()
-	s.engines[def.Name] = newIndexEngine(def, s.registry)
+	s.engines[def.Name] = newIndexEngine(def, s.registry, s.engineCfg)
 	s.mu.Unlock()
 
 	respond(w, http.StatusCreated, map[string]any{"index": def, "timingMs": time.Since(start).Milliseconds()})
@@ -309,15 +424,24 @@ type indexEngine struct {
 	mu sync.RWMutex
 }
 
-func newIndexEngine(def index.Definition, registry *index.Registry) *indexEngine {
+func newIndexEngine(def index.Definition, registry *index.Registry, cfg indexEngineConfig) *indexEngine {
 	tokenizer := index.NewSimpleTokenizer(nil)
+	mergeInterval := cfg.mergeInterval
+	if mergeInterval == 0 {
+		mergeInterval = 30 * time.Second
+	}
+	mergeThreshold := cfg.mergeThreshold
+	if mergeThreshold == 0 {
+		mergeThreshold = 4
+	}
+
 	eng := &indexEngine{
 		def:            def,
 		registry:       registry,
 		tokenizer:      tokenizer,
 		writer:         index.NewInMemoryIndex(def, tokenizer, index.FlushThresholds{}),
-		mergeInterval:  30 * time.Second,
-		mergeThreshold: 4,
+		mergeInterval:  mergeInterval,
+		mergeThreshold: mergeThreshold,
 		mergeCh:        make(chan struct{}, 1),
 		stopCh:         make(chan struct{}),
 	}

@@ -290,5 +290,57 @@ It’s designed as:
   * `Search(index, query)`
   * `IndexDocuments(index, docs)`
 
+---
+
+## 9. Configuration & Operations
+
+### CLI & config files
+
+* Defaults: listens on `:8080`, stores indexes in `data/indexes`, enables request logs + metrics.
+* Flags: `--config` (TOML/YAML), `--listen`, `--index-path`.
+* Environment: `ASTERSEARCH_INDEX_PATH` overrides the storage directory (kept for backward compatibility).
+* Config examples live in `config/examples/config.toml` and `config/examples/config.yaml` and support per-index defaults (tokenizer, BM25 `k1/b`, merge interval/threshold) as well as logging/metrics toggles.
+
+### Running the server directly
+
+```bash
+go run ./... --config ./config/examples/config.toml
+# or override inline
+go run ./... --listen :8080 --index-path ./data/indexes
+```
+
+### Observability hooks
+
+* JSON request logging is on by default; disable via `logging.request_logs = false`.
+* `/v1/metrics` returns basic counters (requests, errors, last status/latency) when enabled.
+* Standard `/v1/health` endpoint is included for liveness probes.
+
+### Systemd unit (for :8080)
+
+* Install the binary at `/usr/local/bin/astersearch` and copy `deploy/systemd/astersearch.service` + `deploy/systemd/astersearch.env` to `/etc/astersearch/`.
+* Ensure the working directory (default `/var/lib/astersearch`) exists and is writable by the `astersearch` user.
+* Reload + start:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now astersearch.service
+sudo journalctl -u astersearch -f
+```
+
+### Reverse proxy (optional)
+
+For TLS or path normalization, place Nginx in front of the service on `:8080`:
+
+```nginx
+location / {
+    proxy_pass http://127.0.0.1:8080;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+}
+```
+
+Keep `/v1/health` and `/v1/metrics` reachable for monitoring.
+
 
 

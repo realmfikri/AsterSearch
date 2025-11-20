@@ -1,0 +1,20 @@
+[server]
+listen = ":8080"
+
+[paths]
+index_dir = "./data/indexes"
+
+[index_defaults]
+tokenizer = "standard"
+merge_interval = "45s"
+merge_threshold = 6
+
+  [index_defaults.bm25]
+  k1 = 1.4
+  b = 0.7
+
+[logging]
+request_logs = true
+
+[metrics]
+enabled = true

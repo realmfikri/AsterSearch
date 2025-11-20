@@ -65,6 +65,7 @@ type CreateRequest struct {
 type Registry struct {
 	basePath string
 	indexes  map[string]Definition
+	defaults CreateDefaults
 	mu       sync.RWMutex
 }
 
@@ -76,8 +77,32 @@ const (
 	maxNameLength    = 64
 )
 
+// CreateDefaults defines baseline values applied to all newly created indexes.
+type CreateDefaults struct {
+	Tokenizer string
+	BM25      BM25Parameters
+}
+
+func (d CreateDefaults) withFallbacks() CreateDefaults {
+	if d.Tokenizer == "" {
+		d.Tokenizer = defaultTokenizer
+	}
+	if d.BM25.K1 == 0 {
+		d.BM25.K1 = defaultK1
+	}
+	if d.BM25.B == 0 {
+		d.BM25.B = defaultB
+	}
+	return d
+}
+
 // NewRegistry loads existing index definitions from disk, ensuring the storage path exists.
 func NewRegistry(basePath string) (*Registry, error) {
+	return NewRegistryWithDefaults(basePath, CreateDefaults{})
+}
+
+// NewRegistryWithDefaults wires index creation defaults and loads existing index definitions from disk.
+func NewRegistryWithDefaults(basePath string, defaults CreateDefaults) (*Registry, error) {
 	if err := os.MkdirAll(basePath, 0o755); err != nil {
 		return nil, fmt.Errorf("create index directory: %w", err)
 	}
@@ -85,6 +110,7 @@ func NewRegistry(basePath string) (*Registry, error) {
 	r := &Registry{
 		basePath: basePath,
 		indexes:  make(map[string]Definition),
+		defaults: defaults.withFallbacks(),
 	}
 
 	if err := r.loadFromDisk(); err != nil {
@@ -103,8 +129,8 @@ func (r *Registry) Create(req CreateRequest) (Definition, error) {
 	def := Definition{
 		Name:      strings.TrimSpace(req.Name),
 		Fields:    normalizeFields(req.Fields),
-		Tokenizer: defaultTokenizer,
-		BM25:      BM25Parameters{K1: defaultK1, B: defaultB},
+		Tokenizer: r.defaults.Tokenizer,
+		BM25:      r.defaults.BM25,
 		Metadata:  IndexMetadata{DocCount: 0, Segments: []SegmentMetadata{}},
 	}
 

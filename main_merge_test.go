@@ -50,7 +50,7 @@ func TestMergeSegmentsPrunesDeletesAndRebuildsStats(t *testing.T) {
 
 func TestIndexEngineCompactionReplacesSegmentsAndMetadata(t *testing.T) {
 	def := index.Definition{Fields: map[string]index.FieldDefinition{"title": {Type: index.FieldTypeText}}}
-	eng := newIndexEngine(def, nil)
+	eng := newIndexEngine(def, nil, indexEngineConfig{})
 	defer close(eng.stopCh)
 
 	segA := index.SegmentSnapshot{Docs: []map[string]any{{"id": "1", "title": "first"}}, Stats: index.BM25Stats{TotalDocs: 1}}
