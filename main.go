@@ -78,7 +78,7 @@ func main() {
 	}
 
 	telemetry := newTelemetry(ctx, logger, cfg.Metrics.Enabled != nil && *cfg.Metrics.Enabled)
-	server := newAPIServer(registry, engineCfg, telemetry, logger)
+	server := newAPIServer(registry, engineCfg, telemetry, logger, cfg.Security)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/indexes", server.handleIndexes)
 	mux.HandleFunc("/v1/indexes/", server.handleIndexByName)
@@ -278,6 +278,8 @@ type apiServer struct {
 	engineCfg indexEngineConfig
 	telemetry *telemetry
 	logger    *slog.Logger
+	auth      *authenticator
+	limiter   *rateLimiter
 	mu        sync.RWMutex
 	ready     atomic.Bool
 }
@@ -288,13 +290,131 @@ type indexEngineConfig struct {
 	flushThresholds index.FlushThresholds
 }
 
-func newAPIServer(registry *index.Registry, engCfg indexEngineConfig, telemetry *telemetry, logger *slog.Logger) *apiServer {
+type authScope string
+
+const (
+	scopeAdmin authScope = "admin"
+	scopeIndex authScope = "index"
+)
+
+type authenticator struct {
+	adminTokens map[string]struct{}
+	indexTokens map[string]struct{}
+}
+
+func newAuthenticator(cfg config.SecurityConfig) *authenticator {
+	auth := &authenticator{adminTokens: make(map[string]struct{}), indexTokens: make(map[string]struct{})}
+	for _, token := range cfg.AdminTokens {
+		auth.adminTokens[token] = struct{}{}
+	}
+	for _, token := range cfg.IndexTokens {
+		auth.indexTokens[token] = struct{}{}
+	}
+	return auth
+}
+
+func (a *authenticator) authorize(r *http.Request, scope authScope) (string, bool) {
+	token := extractToken(r)
+	clientID := token
+	if clientID == "" {
+		host := r.RemoteAddr
+		if strings.Contains(host, ":") {
+			parts := strings.Split(host, ":")
+			host = strings.Join(parts[:len(parts)-1], ":")
+		}
+		clientID = host
+	}
+
+	switch scope {
+	case scopeAdmin:
+		if len(a.adminTokens) == 0 {
+			return clientID, true
+		}
+		_, ok := a.adminTokens[token]
+		return clientID, ok
+	case scopeIndex:
+		if len(a.indexTokens) == 0 && len(a.adminTokens) == 0 {
+			return clientID, true
+		}
+		if _, ok := a.indexTokens[token]; ok {
+			return clientID, true
+		}
+		if _, ok := a.adminTokens[token]; ok {
+			return clientID, true
+		}
+		return clientID, false
+	default:
+		return clientID, false
+	}
+}
+
+func extractToken(r *http.Request) string {
+	authHeader := r.Header.Get("Authorization")
+	if strings.HasPrefix(strings.ToLower(authHeader), "bearer ") {
+		return strings.TrimSpace(authHeader[7:])
+	}
+	if authHeader != "" {
+		return strings.TrimSpace(authHeader)
+	}
+	if key := r.Header.Get("X-API-Key"); key != "" {
+		return strings.TrimSpace(key)
+	}
+	return ""
+}
+
+type rateLimiter struct {
+	limit  int
+	window time.Duration
+
+	mu      sync.Mutex
+	entries map[string]clientWindow
+}
+
+type clientWindow struct {
+	count   int
+	resetAt time.Time
+}
+
+func newRateLimiter(cfg config.RateLimitConfig) *rateLimiter {
+	limit := cfg.RequestsPerMin
+	if limit == 0 {
+		limit = 0
+	}
+	return &rateLimiter{limit: limit, window: time.Minute, entries: make(map[string]clientWindow)}
+}
+
+func (r *rateLimiter) allow(key string) bool {
+	if r.limit <= 0 {
+		return true
+	}
+	now := time.Now()
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	cw, ok := r.entries[key]
+	if !ok || now.After(cw.resetAt) {
+		r.entries[key] = clientWindow{count: 1, resetAt: now.Add(r.window)}
+		return true
+	}
+
+	if cw.count >= r.limit {
+		return false
+	}
+	cw.count++
+	r.entries[key] = cw
+	return true
+}
+
+func newAPIServer(registry *index.Registry, engCfg indexEngineConfig, telemetry *telemetry, logger *slog.Logger, security config.SecurityConfig) *apiServer {
 	server := &apiServer{
 		registry:  registry,
 		engines:   make(map[string]*indexEngine),
 		engineCfg: engCfg,
 		telemetry: telemetry,
 		logger:    logger,
+		auth:      newAuthenticator(security),
+		limiter:   newRateLimiter(security.RateLimit),
 	}
 
 	for _, def := range registry.List() {
@@ -303,6 +423,25 @@ func newAPIServer(registry *index.Registry, engCfg indexEngineConfig, telemetry 
 	server.ready.Store(true)
 
 	return server
+}
+
+func (s *apiServer) authorizeAndLimit(w http.ResponseWriter, r *http.Request, scope authScope, index string, start time.Time) (string, bool) {
+	clientID, ok := s.auth.authorize(r, scope)
+	if !ok {
+		respondError(w, http.StatusUnauthorized, "unauthorized", start)
+		return "", false
+	}
+
+	key := string(scope) + ":" + clientID
+	if index != "" {
+		key = string(scope) + ":" + index + ":" + clientID
+	}
+	if !s.limiter.allow(key) {
+		respondError(w, http.StatusTooManyRequests, "rate limit exceeded", start)
+		return "", false
+	}
+
+	return clientID, true
 }
 
 func (s *apiServer) handleIndexes(w http.ResponseWriter, r *http.Request) {
@@ -317,6 +456,7 @@ func (s *apiServer) handleIndexes(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *apiServer) handleIndexByName(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
 	if !strings.HasPrefix(r.URL.Path, "/v1/indexes/") {
 		http.NotFound(w, r)
 		return
@@ -333,6 +473,10 @@ func (s *apiServer) handleIndexByName(w http.ResponseWriter, r *http.Request) {
 	if len(segments) == 1 {
 		if r.Method != http.MethodGet {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		if _, ok := s.authorizeAndLimit(w, r, scopeAdmin, name, start); !ok {
 			return
 		}
 
@@ -367,6 +511,10 @@ func (s *apiServer) handleIndexByName(w http.ResponseWriter, r *http.Request) {
 func (s *apiServer) createIndex(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 
+	if _, ok := s.authorizeAndLimit(w, r, scopeAdmin, "", start); !ok {
+		return
+	}
+
 	var req index.CreateRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		respondError(w, http.StatusBadRequest, "invalid json payload", start)
@@ -386,8 +534,11 @@ func (s *apiServer) createIndex(w http.ResponseWriter, r *http.Request) {
 	respond(w, http.StatusCreated, map[string]any{"index": def, "timingMs": time.Since(start).Milliseconds()})
 }
 
-func (s *apiServer) listIndexes(w http.ResponseWriter, _ *http.Request) {
+func (s *apiServer) listIndexes(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
+	if _, ok := s.authorizeAndLimit(w, r, scopeAdmin, "", start); !ok {
+		return
+	}
 	indexes := s.registry.List()
 	respond(w, http.StatusOK, map[string]any{"indexes": indexes, "timingMs": time.Since(start).Milliseconds()})
 }
@@ -399,6 +550,10 @@ func (s *apiServer) indexDocuments(w http.ResponseWriter, r *http.Request, name 
 	engine, ok := s.getEngine(name)
 	if !ok {
 		respondError(w, http.StatusNotFound, "index not found", start)
+		return
+	}
+
+	if _, ok := s.authorizeAndLimit(w, r, scopeIndex, name, start); !ok {
 		return
 	}
 
@@ -438,8 +593,12 @@ func (s *apiServer) indexDocuments(w http.ResponseWriter, r *http.Request, name 
 	}
 }
 
-func (s *apiServer) indexStats(w http.ResponseWriter, _ *http.Request, name string) {
+func (s *apiServer) indexStats(w http.ResponseWriter, r *http.Request, name string) {
 	start := time.Now()
+
+	if _, ok := s.authorizeAndLimit(w, r, scopeAdmin, name, start); !ok {
+		return
+	}
 
 	def, ok := s.registry.Get(name)
 	if !ok {

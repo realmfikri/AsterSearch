@@ -301,6 +301,21 @@ It’s designed as:
 * Environment: `ASTERSEARCH_INDEX_PATH` overrides the storage directory (kept for backward compatibility).
 * Config examples live in `config/examples/config.toml` and `config/examples/config.yaml` and support per-index defaults (tokenizer, BM25 `k1/b`, merge interval/threshold, flush_max_documents/flush_max_postings) as well as logging/metrics toggles.
 
+### Authentication, authorization, and rate limits
+
+* Protect admin endpoints (`/v1/indexes`, `/v1/indexes/{name}`, `/v1/indexes/{name}/stats`) by setting one or more `security.admin_tokens` entries.
+* Lock down indexing (`/v1/indexes/{name}/documents`) with `security.index_tokens` (admin tokens are also accepted for writers).
+* Tokens are checked from `Authorization: Bearer <token>` or `X-API-Key: <token>` headers. When no tokens are configured, the endpoints remain open for backward compatibility.
+* Throttle abusive clients with `security.rate_limit.requests_per_min` (per-client, per-index). Example TOML fragment:
+
+  ```toml
+  [security]
+  admin_tokens = ["super-secret"]
+  index_tokens = ["writer-token"]
+  [security.rate_limit]
+  requests_per_min = 120
+  ```
+
 ### Running the server directly
 
 ```bash
