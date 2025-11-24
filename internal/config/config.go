@@ -19,6 +19,7 @@ type AppConfig struct {
 	IndexDefaults IndexDefaultsConfig `toml:"index_defaults" yaml:"index_defaults"`
 	Logging       LoggingConfig       `toml:"logging" yaml:"logging"`
 	Metrics       MetricsConfig       `toml:"metrics" yaml:"metrics"`
+	Security      SecurityConfig      `toml:"security" yaml:"security"`
 }
 
 // ServerConfig controls network settings.
@@ -57,6 +58,18 @@ type MetricsConfig struct {
 	Enabled *bool `toml:"enabled" yaml:"enabled"`
 }
 
+// SecurityConfig contains API authentication and throttling options.
+type SecurityConfig struct {
+	AdminTokens []string        `toml:"admin_tokens" yaml:"admin_tokens"`
+	IndexTokens []string        `toml:"index_tokens" yaml:"index_tokens"`
+	RateLimit   RateLimitConfig `toml:"rate_limit" yaml:"rate_limit"`
+}
+
+// RateLimitConfig throttles high-volume clients.
+type RateLimitConfig struct {
+	RequestsPerMin int `toml:"requests_per_min" yaml:"requests_per_min"`
+}
+
 // DefaultConfig returns the baseline configuration used when no file is supplied.
 func DefaultConfig() AppConfig {
 	return AppConfig{
@@ -70,8 +83,9 @@ func DefaultConfig() AppConfig {
 			FlushMaxDocs:   512,
 			FlushMaxPosts:  50000,
 		},
-		Logging: LoggingConfig{RequestLogs: boolPtr(true)},
-		Metrics: MetricsConfig{Enabled: boolPtr(true)},
+		Logging:  LoggingConfig{RequestLogs: boolPtr(true)},
+		Metrics:  MetricsConfig{Enabled: boolPtr(true)},
+		Security: SecurityConfig{RateLimit: RateLimitConfig{RequestsPerMin: 240}},
 	}
 }
 
@@ -142,6 +156,16 @@ func mergeConfig(base, override AppConfig) AppConfig {
 
 	if override.Metrics.Enabled != nil {
 		base.Metrics.Enabled = override.Metrics.Enabled
+	}
+
+	if len(override.Security.AdminTokens) > 0 {
+		base.Security.AdminTokens = override.Security.AdminTokens
+	}
+	if len(override.Security.IndexTokens) > 0 {
+		base.Security.IndexTokens = override.Security.IndexTokens
+	}
+	if override.Security.RateLimit.RequestsPerMin != 0 {
+		base.Security.RateLimit.RequestsPerMin = override.Security.RateLimit.RequestsPerMin
 	}
 
 	return base
